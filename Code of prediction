@@ -1,0 +1,550 @@
+
+
+import time
+import numpy as np
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.model_selection import RandomizedSearchCV
+
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
+
+from skopt import BayesSearchCV
+from skopt.space import Real, Integer, Categorical
+
+
+INPUT_FEATURES = [
+    "H", "T", "WS", "SR", "DtG", "DtS",
+    "LC", "I3", "I5", "THD", "φ", "RQ",
+    "P", "AQI", "OT"
+]
+
+TARGET_COLUMN = "ESDD"
+
+
+class ESDDApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ESDD Prediction GUI")
+        self.root.geometry("1350x820")
+
+        self.train_df = None
+        self.test_df = None
+        self.best_model = None
+        self.model_name = None
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        top = tk.Frame(self.root)
+        top.pack(fill=tk.X, padx=10, pady=8)
+
+        tk.Button(top, text="Upload Training Data", command=self.upload_training_data, width=20).pack(side=tk.LEFT, padx=4)
+        tk.Button(top, text="Train + Plot Training", command=self.train_and_plot, width=22).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(top, text="Upload Testing Data", command=self.upload_testing_data, width=20).pack(side=tk.LEFT, padx=4)
+        tk.Button(top, text="Predict + Plot Testing", command=self.predict_testing_data, width=22).pack(side=tk.LEFT, padx=4)
+
+        tk.Label(top, text="Model:").pack(side=tk.LEFT, padx=3)
+        self.model_box = ttk.Combobox(top, values=["SVM", "NN", "ERT", "GPR"], state="readonly", width=8)
+        self.model_box.set("SVM")
+        self.model_box.pack(side=tk.LEFT, padx=3)
+
+        tk.Label(top, text="Optimization:").pack(side=tk.LEFT, padx=3)
+        self.opt_box = ttk.Combobox(
+            top,
+            values=["Random Search", "Bayesian Optimization"],
+            state="readonly",
+            width=20
+        )
+        self.opt_box.set("Random Search")
+        self.opt_box.pack(side=tk.LEFT, padx=3)
+
+        tk.Label(top, text="Fig W:").pack(side=tk.LEFT, padx=3)
+        self.fig_w_entry = tk.Entry(top, width=5)
+        self.fig_w_entry.insert(0, "11")
+        self.fig_w_entry.pack(side=tk.LEFT)
+
+        tk.Label(top, text="Fig H:").pack(side=tk.LEFT, padx=3)
+        self.fig_h_entry = tk.Entry(top, width=5)
+        self.fig_h_entry.insert(0, "5")
+        self.fig_h_entry.pack(side=tk.LEFT)
+
+        tk.Label(top, text="DPI:").pack(side=tk.LEFT, padx=3)
+        self.dpi_entry = tk.Entry(top, width=5)
+        self.dpi_entry.insert(0, "120")
+        self.dpi_entry.pack(side=tk.LEFT)
+
+        tk.Button(top, text="Apply Size", command=self.apply_figure_settings, width=11).pack(side=tk.LEFT, padx=4)
+        tk.Button(top, text="Save Figure", command=self.save_figure, width=12).pack(side=tk.LEFT, padx=4)
+        tk.Button(top, text="Save Predictions", command=self.save_predictions, width=15).pack(side=tk.LEFT, padx=4)
+
+        self.status = tk.Label(self.root, text="Upload training data first", fg="blue")
+        self.status.pack(pady=3)
+
+        self.metric_text = tk.Text(self.root, height=11, width=155)
+        self.metric_text.pack(padx=10, pady=5)
+
+        self.fig, self.ax = plt.subplots(figsize=(11, 5), dpi=120)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def load_file(self):
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("CSV files", "*.csv"),
+                ("Excel files", "*.xlsx *.xls")
+            ]
+        )
+
+        if not path:
+            return None
+
+        if path.endswith(".csv"):
+            return pd.read_csv(path)
+        return pd.read_excel(path)
+
+    def validate_data(self, df, require_target=True):
+        required = INPUT_FEATURES.copy()
+
+        if require_target:
+            required.append(TARGET_COLUMN)
+
+        missing = [c for c in required if c not in df.columns]
+
+        if missing:
+            messagebox.showerror(
+                "Missing Columns",
+                f"Missing columns:\n{missing}\n\n"
+                f"Required input columns:\n{INPUT_FEATURES}\n\n"
+                f"Target column: {TARGET_COLUMN}"
+            )
+            return None
+
+        df = df.dropna(subset=required)
+        return df
+
+    def upload_training_data(self):
+        df = self.load_file()
+
+        if df is None:
+            return
+
+        df = self.validate_data(df, require_target=True)
+
+        if df is None:
+            return
+
+        self.train_df = df
+        self.status.config(text=f"Training data loaded: {len(df)} rows", fg="green")
+
+    def upload_testing_data(self):
+        df = self.load_file()
+
+        if df is None:
+            return
+
+        has_target = TARGET_COLUMN in df.columns
+        df = self.validate_data(df, require_target=has_target)
+
+        if df is None:
+            return
+
+        self.test_df = df
+
+        if has_target:
+            self.status.config(text=f"Testing data loaded with ESDD: {len(df)} rows", fg="green")
+        else:
+            self.status.config(text=f"Testing data loaded without ESDD: {len(df)} rows", fg="green")
+
+    def get_model_and_space(self, model_name):
+        if model_name == "SVM":
+            model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("regressor", SVR())
+            ])
+
+            random_space = {
+                "regressor__C": np.logspace(-2, 3, 30),
+                "regressor__gamma": np.logspace(-4, 1, 30),
+                "regressor__epsilon": np.linspace(0.001, 1, 30),
+                "regressor__kernel": ["rbf", "poly", "sigmoid"]
+            }
+
+            bayes_space = {
+                "regressor__C": Real(1e-2, 1e3, prior="log-uniform"),
+                "regressor__gamma": Real(1e-4, 1e1, prior="log-uniform"),
+                "regressor__epsilon": Real(1e-3, 1.0, prior="log-uniform"),
+                "regressor__kernel": Categorical(["rbf", "poly", "sigmoid"])
+            }
+
+        elif model_name == "NN":
+            model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("regressor", MLPRegressor(max_iter=2000, random_state=42))
+            ])
+
+            random_space = {
+                "regressor__hidden_layer_sizes": [(30,), (50,), (100,), (50, 50), (100, 50)],
+                "regressor__activation": ["relu", "tanh"],
+                "regressor__alpha": np.logspace(-5, -1, 20),
+                "regressor__learning_rate_init": np.logspace(-4, -1, 20)
+            }
+
+            bayes_space = {
+                "regressor__hidden_layer_sizes": Categorical([(30,), (50,), (100,), (50, 50), (100, 50)]),
+                "regressor__activation": Categorical(["relu", "tanh"]),
+                "regressor__alpha": Real(1e-5, 1e-1, prior="log-uniform"),
+                "regressor__learning_rate_init": Real(1e-4, 1e-1, prior="log-uniform")
+            }
+
+        elif model_name == "ERT":
+            model = ExtraTreesRegressor(random_state=42)
+
+            random_space = {
+                "n_estimators": [100, 200, 300, 500],
+                "max_depth": [None, 5, 10, 20, 30],
+                "min_samples_split": [2, 3, 5, 10],
+                "min_samples_leaf": [1, 2, 4],
+                "max_features": ["sqrt", "log2", 1.0]
+            }
+
+            bayes_space = {
+                "n_estimators": Integer(100, 500),
+                "max_depth": Integer(3, 40),
+                "min_samples_split": Integer(2, 10),
+                "min_samples_leaf": Integer(1, 5),
+                "max_features": Categorical(["sqrt", "log2", 1.0])
+            }
+
+        else:
+            kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=1.0)
+
+            model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("regressor", GaussianProcessRegressor(
+                    kernel=kernel,
+                    normalize_y=True,
+                    random_state=42
+                ))
+            ])
+
+            random_space = {
+                "regressor__alpha": np.logspace(-10, -2, 20),
+                "regressor__n_restarts_optimizer": [0, 1, 2, 3, 5]
+            }
+
+            bayes_space = {
+                "regressor__alpha": Real(1e-10, 1e-2, prior="log-uniform"),
+                "regressor__n_restarts_optimizer": Integer(0, 5)
+            }
+
+        return model, random_space, bayes_space
+
+    def optimize_model(self, model, random_space, bayes_space):
+        opt_method = self.opt_box.get()
+
+        if opt_method == "Random Search":
+            return RandomizedSearchCV(
+                estimator=model,
+                param_distributions=random_space,
+                n_iter=25,
+                cv=5,
+                scoring="neg_root_mean_squared_error",
+                random_state=42,
+                n_jobs=-1
+            )
+
+        return BayesSearchCV(
+            estimator=model,
+            search_spaces=bayes_space,
+            n_iter=25,
+            cv=5,
+            scoring="neg_root_mean_squared_error",
+            random_state=42,
+            n_jobs=-1
+        )
+
+    def train_and_plot(self):
+        if self.train_df is None:
+            messagebox.showwarning("No Training Data", "Please upload training data first.")
+            return
+
+        self.model_name = self.model_box.get()
+        opt_method = self.opt_box.get()
+
+        X_train = self.train_df[INPUT_FEATURES]
+        y_train = self.train_df[TARGET_COLUMN]
+
+        model, random_space, bayes_space = self.get_model_and_space(self.model_name)
+        search = self.optimize_model(model, random_space, bayes_space)
+
+        try:
+            start_train = time.time()
+            search.fit(X_train, y_train)
+            train_time = time.time() - start_train
+
+            self.best_model = search.best_estimator_
+
+            start_pred = time.time()
+            y_pred, lower, upper = self.predict_with_interval(X_train)
+            pred_time = time.time() - start_pred
+
+            self.train_df["Predicted_ESDD"] = y_pred
+            self.train_df["Lower_95"] = lower
+            self.train_df["Upper_95"] = upper
+
+            self.show_metrics(
+                title="TRAINING RESULTS",
+                y_true=y_train,
+                y_pred=y_pred,
+                train_time=train_time,
+                pred_time=pred_time,
+                best_params=search.best_params_
+            )
+
+            self.plot_results(
+                y_true=y_train,
+                y_pred=y_pred,
+                lower=lower,
+                upper=upper,
+                title=f"Training Prediction: {self.model_name} + {opt_method}"
+            )
+
+            self.status.config(text="Training completed. Upload testing data next.", fg="green")
+
+        except Exception as e:
+            messagebox.showerror("Training Error", str(e))
+
+    def predict_testing_data(self):
+        if self.best_model is None:
+            messagebox.showwarning("No Model", "Please train the model first.")
+            return
+
+        if self.test_df is None:
+            messagebox.showwarning("No Testing Data", "Please upload testing data first.")
+            return
+
+        X_test = self.test_df[INPUT_FEATURES]
+        y_test = self.test_df[TARGET_COLUMN] if TARGET_COLUMN in self.test_df.columns else None
+
+        try:
+            start_pred = time.time()
+            y_pred, lower, upper = self.predict_with_interval(X_test)
+            pred_time = time.time() - start_pred
+
+            self.test_df["Predicted_ESDD"] = y_pred
+            self.test_df["Lower_95"] = lower
+            self.test_df["Upper_95"] = upper
+
+            if y_test is not None:
+                self.show_metrics(
+                    title="TESTING RESULTS",
+                    y_true=y_test,
+                    y_pred=y_pred,
+                    train_time=None,
+                    pred_time=pred_time,
+                    best_params=None
+                )
+            else:
+                speed = len(X_test) / pred_time if pred_time > 0 else np.inf
+                self.metric_text.delete("1.0", tk.END)
+                self.metric_text.insert(
+                    tk.END,
+                    f"""
+TESTING RESULTS
+
+No actual ESDD column found in testing data.
+Only prediction was plotted.
+
+Prediction Time: {pred_time:.6f} seconds
+Prediction Speed: {speed:.2f} samples/second
+"""
+                )
+
+            self.plot_results(
+                y_true=y_test,
+                y_pred=y_pred,
+                lower=lower,
+                upper=upper,
+                title=f"Testing Prediction: {self.model_name}"
+            )
+
+            self.status.config(text="Testing prediction completed", fg="green")
+
+        except Exception as e:
+            messagebox.showerror("Testing Error", str(e))
+
+    def predict_with_interval(self, X):
+        if self.model_name == "GPR":
+            y_pred, y_std = self.best_model.predict(X, return_std=True)
+            lower = y_pred - 1.96 * y_std
+            upper = y_pred + 1.96 * y_std
+        else:
+            y_pred = self.best_model.predict(X)
+
+            train_x = self.train_df[INPUT_FEATURES]
+            train_y = self.train_df[TARGET_COLUMN]
+            train_pred = self.best_model.predict(train_x)
+
+            residual_std = np.std(train_y - train_pred)
+
+            lower = y_pred - 1.96 * residual_std
+            upper = y_pred + 1.96 * residual_std
+
+        return y_pred, lower, upper
+
+    def show_metrics(self, title, y_true, y_pred, train_time=None, pred_time=None, best_params=None):
+        mse = mean_squared_error(y_true, y_pred)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+
+        speed = len(y_true) / pred_time if pred_time and pred_time > 0 else np.inf
+
+        self.metric_text.delete("1.0", tk.END)
+
+        text = f"""
+{title}
+
+Model: {self.model_name}
+Optimization: {self.opt_box.get()}
+
+R² Score: {r2:.6f}
+RMSE: {rmse:.6f}
+MSE: {mse:.6f}
+MAE: {mae:.6f}
+"""
+
+        if train_time is not None:
+            text += f"\nTraining Time: {train_time:.6f} seconds"
+
+        if pred_time is not None:
+            text += f"""
+Prediction Time: {pred_time:.6f} seconds
+Prediction Speed: {speed:.2f} samples/second
+"""
+
+        if best_params is not None:
+            text += f"\nBest Parameters:\n{best_params}"
+
+        self.metric_text.insert(tk.END, text)
+
+    def plot_results(self, y_true, y_pred, lower, upper, title):
+        self.apply_figure_settings(redraw_only=True)
+
+        self.ax.clear()
+        x = np.arange(len(y_pred))
+
+        if y_true is not None:
+            self.ax.plot(x, y_true.values, label="Actual ESDD", linewidth=2)
+
+        self.ax.plot(x, y_pred, label="Predicted ESDD", linewidth=2)
+
+        self.ax.fill_between(
+            x,
+            lower,
+            upper,
+            alpha=0.25,
+            label="95% Prediction Interval"
+        )
+
+        self.ax.set_title(title, fontsize=13, fontweight="bold")
+        self.ax.set_xlabel("Time / Sample Index", fontsize=11)
+        self.ax.set_ylabel("ESDD", fontsize=11)
+        self.ax.grid(True)
+        self.ax.legend()
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def apply_figure_settings(self, redraw_only=False):
+        try:
+            fig_w = float(self.fig_w_entry.get())
+            fig_h = float(self.fig_h_entry.get())
+            dpi = int(self.dpi_entry.get())
+
+            self.fig.set_size_inches(fig_w, fig_h)
+            self.fig.set_dpi(dpi)
+
+            if not redraw_only:
+                self.fig.tight_layout()
+                self.canvas.draw()
+
+        except Exception as e:
+            if not redraw_only:
+                messagebox.showerror("Figure Setting Error", str(e))
+
+    def save_figure(self):
+        try:
+            dpi = int(self.dpi_entry.get())
+
+            path = filedialog.asksaveasfilename(
+                defaultextension=".png",
+                filetypes=[
+                    ("PNG Image", "*.png"),
+                    ("TIFF Image", "*.tiff"),
+                    ("JPEG Image", "*.jpg"),
+                    ("PDF File", "*.pdf"),
+                    ("SVG File", "*.svg")
+                ]
+            )
+
+            if not path:
+                return
+
+            self.fig.savefig(path, dpi=dpi, bbox_inches="tight")
+            messagebox.showinfo("Saved", f"Figure saved successfully:\n{path}")
+
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def save_predictions(self):
+        try:
+            if self.test_df is not None and "Predicted_ESDD" in self.test_df.columns:
+                df_to_save = self.test_df
+                default_name = "testing_predictions.xlsx"
+            elif self.train_df is not None and "Predicted_ESDD" in self.train_df.columns:
+                df_to_save = self.train_df
+                default_name = "training_predictions.xlsx"
+            else:
+                messagebox.showwarning("No Predictions", "No predictions available to save.")
+                return
+
+            path = filedialog.asksaveasfilename(
+                initialfile=default_name,
+                defaultextension=".xlsx",
+                filetypes=[
+                    ("Excel file", "*.xlsx"),
+                    ("CSV file", "*.csv")
+                ]
+            )
+
+            if not path:
+                return
+
+            if path.endswith(".csv"):
+                df_to_save.to_csv(path, index=False)
+            else:
+                df_to_save.to_excel(path, index=False)
+
+            messagebox.showinfo("Saved", f"Predictions saved successfully:\n{path}")
+
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ESDDApp(root)
+    root.mainloop()
